@@ -1,0 +1,31 @@
+{
+  "controller": "https://<dmfControllerURL>",
+  "policy_name": "elephant-flows",
+  "token": "<Auth Bearer Token>",
+  "ntop_log": "/var/log/ntopng/elephants.log",
+
+  "seq_min": 100,
+  "seq_max": 2000,
+
+  "window_seconds": 20,
+  "packet_threshold": 5,
+  "batch_enabled": true,
+  "batch_flush_interval": 0.5,
+  "max_rules_per_sec": 5,
+  "max_rules_per_batch": 20,
+
+  "reset_cooldown_sec": 6,
+  "min_hold_after_add_sec": 10,
+  "prune_inactive_after": 90,
+  "consecutive_slow_windows": 2,
+
+  "poll_interval": 1.0,
+  "housekeep_interval": 60,
+
+  "state_file": "/var/lib/elephant-guard/state.json",
+  "run_dir": "/run/elephant-guard",
+  "activity_log": "/var/log/elephant-guard/activity.log",
+
+  "verify_tls": false
+}
+

@@ -1,0 +1,43 @@
+[Unit]
+Description=DMF Elephant Flow Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntopng
+Group=ntopng
+
+# systemd-managed dirs (created with ntopng:ntopng ownership)
+RuntimeDirectory=elephant-guard
+RuntimeDirectoryMode=0750
+StateDirectory=elephant-guard
+StateDirectoryMode=0750
+LogsDirectory=elephant-guard
+LogsDirectoryMode=0750
+
+# Run from state dir (optional, tidy)
+WorkingDirectory=/var/lib/elephant-guard
+
+# Start the daemon
+ExecStart=/usr/bin/python3 /usr/local/bin/elephant_guard.py -c /etc/eguard/elephant-guard.json
+
+# Stop the daemon
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutStopSec=30
+
+# Filesystem hardening
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Allow writes only to our state, runtime, and logs paths
+ReadWritePaths=/var/lib/elephant-guard /run/elephant-guard /var/log/elephant-guard
+
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
