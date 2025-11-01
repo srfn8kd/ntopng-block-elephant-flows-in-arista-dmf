@@ -7,10 +7,11 @@ Daemon to:
   - add 1:1 (src,dst) rules to DMF policy
   - prune rules using a resilient, stateful heuristic
 
-Resilient pruning:
-  - Detects counter resets via last-reset-time or decreasing counters
-  - Applies cooldown after reset and a hold after add
-  - Prunes on either long inactivity or sustained below-threshold growth
+Features:
+  - Reset-aware pruning (handles DMF/OpenFlow counter resets via last-reset-time)
+  - Batching with token-bucket rate limiting to avoid overwhelming the controller
+  - Hysteresis: cooldown after reset and hold after add
+  - Aggressive prune during controller-quiet gaps (no adds/deletes, empty queue)
 
 Python: 3.9+
 Requires: requests
@@ -37,7 +38,7 @@ except Exception:
 
 # --------------------------------------------------------------------
 # Regex: parse ntopng Elephant Flow lines
-# Example line:
+# Example:
 # 2025-10-31T20:17:30Z ... [Elephant Flow] [1.1.1.1:42367 -> 1.0.0.1:443]  Elephant Flow
 # --------------------------------------------------------------------
 ELEPHANT_RE = re.compile(
@@ -125,7 +126,7 @@ class State:
                 "last_reset": str,
                 "ts": float,                # last baseline update
                 "added_ts": float,          # when rule was added/adopted
-                "last_increase_ts": float,  # last time pkt increased
+                "last_increase_ts": float,  # last time packet-count rose
                 "cooldown_until": float,    # skip-prune until
                 "slow_windows": int         # consecutive windows below threshold
             }
@@ -389,6 +390,10 @@ class ElephantGuard:
         self.tokens = float(self.cfg.max_rules_per_sec)  # start full
         self.last_flush = time.time()
 
+        # Controller quiet detection / mutation tracking
+        self.controller_quiet_until = 0.0
+        self.last_mutation_ts = 0.0
+
         signal.signal(signal.SIGINT, self._signal_stop)
         signal.signal(signal.SIGTERM, self._signal_stop)
 
@@ -432,9 +437,16 @@ class ElephantGuard:
                     except Exception as e:
                         log_line(self.cfg.log_file, f"[error] processing {src_ip}->{dst_ip}: {e}")
 
+            # Timed batch flush
             if self.cfg.batch_enabled and (now - self.last_flush) >= self.cfg.batch_flush_interval:
                 self._flush_batch()
                 self.last_flush = now
+
+            # Controller-quiet aggressive prune: no pending adds, no recent mutations, outside quiet
+            if self.cfg.batch_enabled and not self.pending_pairs:
+                quiet_gap = now - max(self.last_mutation_ts, 0.0)
+                if quiet_gap >= self.cfg.window_seconds and now >= self.controller_quiet_until:
+                    self.prune_aggressive()
 
         self._clean_shutdown()
 
@@ -488,7 +500,6 @@ class ElephantGuard:
                 if src and dst and (self.cfg.seq_min <= seq <= self.cfg.seq_max):
                     self.state.seq_map[(src, dst)] = seq
                     self.state.seq_used.add(seq)
-                    # If we adopt existing rules, seed added_ts reasonably
                     ps = self.state.pkt_state.get(seq, {})
                     ps.setdefault("added_ts", now)
                     self.state.pkt_state[seq] = ps
@@ -502,7 +513,7 @@ class ElephantGuard:
             log_line(self.cfg.log_file, f"[warn] get_flow_info failed during warmup: {e}")
             counts = {}
 
-        self.state.pkt_state = {**self.state.pkt_state}  # ensure dict exists
+        self.state.pkt_state = {**self.state.pkt_state}
         for seq in self.state.seq_used:
             c = counts.get(seq, {})
             pkt = int(c.get("packet_count", 0))
@@ -542,7 +553,7 @@ class ElephantGuard:
 
         to_take = min(allowance, self.cfg.max_rules_per_batch, len(self.pending_pairs))
 
-        # Single prune pass for entire batch
+        # One prune pass for entire batch
         try:
             self.prune_once()
         except Exception as e:
@@ -567,6 +578,59 @@ class ElephantGuard:
             qlen = len(self.pending_pairs)
             log_line(self.cfg.log_file, f"[batch] added={added} allowed={to_take} remaining_queue={qlen} tokens={self.tokens:.2f}")
 
+    # ---- aggressive prune when fabric quiet ----
+
+    def prune_aggressive(self):
+        """
+        Strict, one-shot prune for truly idle entries during controller-quiet periods.
+        Conditions (per-seq):
+          - outside cooldown/hold
+          - AND (no_increase_for >= window_seconds)
+        Ignores 'consecutive_slow_windows' and baseline subtleties.
+        """
+        try:
+            counts = self.dmf.get_flow_info()
+        except Exception as e:
+            log_line(self.cfg.log_file, f"[warn] prune_aggressive: get_flow_info failed: {e}")
+            return
+
+        now = time.time()
+        to_remove = []
+
+        for (src, dst), seq in list(self.state.seq_map.items()):
+            ps = self.state.pkt_state.get(seq)
+            if not ps:
+                continue
+            if now < float(ps.get("cooldown_until", 0)):
+                continue
+            if now - float(ps.get("added_ts", now)) < self.cfg.min_hold_after_add_sec:
+                continue
+
+            new = counts.get(seq, {})
+            new_pkt = int(new.get("packet_count", 0))
+            prev_pkt = int(ps.get("pkt", 0))
+            delta = new_pkt - prev_pkt if new_pkt >= prev_pkt else 0
+
+            last_increase_ts = float(ps.get("last_increase_ts", 0)) or float(ps.get("added_ts", now))
+            if delta > 0:
+                last_increase_ts = now
+                ps["pkt"] = new_pkt
+                ps["ts"] = now
+                ps["last_increase_ts"] = last_increase_ts
+                self.state.pkt_state[seq] = ps
+                continue
+
+            no_increase_for = now - last_increase_ts
+            if no_increase_for >= self.cfg.window_seconds:
+                to_remove.append(seq)
+
+        for seq in to_remove:
+            self._remove_seq(seq)
+
+        if to_remove:
+            self.state.save()
+            log_line(self.cfg.log_file, f"[prune-aggressive] removed {len(to_remove)} rule(s)")
+
     # ---- operations ----
 
     def process_new_elephant(self, src_ip: str, dst_ip: str):
@@ -576,7 +640,6 @@ class ElephantGuard:
             log_line(self.cfg.log_file, f"[dup] {src_ip}->{dst_ip} already in policy seq={seq}")
             return
 
-        # prune before allocating
         self.prune_once()
         self._process_new_elephant_no_prune(src_ip, dst_ip)
 
@@ -593,9 +656,13 @@ class ElephantGuard:
 
         self.dmf.put_rule(seq, src_ip, dst_ip)
 
+        # mutation markers
+        now = time.time()
+        self.last_mutation_ts = now
+        self.controller_quiet_until = now + self.cfg.reset_cooldown_sec
+
         self.alloc.reserve(seq)
         self.state.seq_map[key] = seq
-        now = time.time()
 
         # Seed counters after add
         pkt = 0
@@ -621,7 +688,11 @@ class ElephantGuard:
         self.state.save()
 
     def prune_once(self):
-        """Reset-aware, hysteretic pruning."""
+        """Reset-aware, hysteretic pruning (standard path)."""
+        # Global quiet guard
+        if time.time() < self.controller_quiet_until:
+            return
+
         try:
             counts = self.dmf.get_flow_info()
         except Exception as e:
@@ -631,7 +702,6 @@ class ElephantGuard:
         now = time.time()
         to_remove: List[int] = []
 
-        # Iterate over active rules
         for (src, dst), seq in list(self.state.seq_map.items()):
             if not (self.cfg.seq_min <= seq <= self.cfg.seq_max):
                 continue
@@ -642,7 +712,6 @@ class ElephantGuard:
 
             ps = self.state.pkt_state.get(seq, None)
             if ps is None:
-                # Seed a conservative state if missing
                 self.state.pkt_state[seq] = {
                     "pkt": new_pkt, "last_reset": new_lrt, "ts": now,
                     "added_ts": now, "last_increase_ts": now if new_pkt > 0 else 0.0,
@@ -668,30 +737,28 @@ class ElephantGuard:
                     "last_reset": new_lrt,
                     "ts": now,
                     "added_ts": added_ts,
-                    "last_increase_ts": last_increase_ts,  # keep last known increase time
+                    "last_increase_ts": last_increase_ts,
                     "cooldown_until": now + self.cfg.reset_cooldown_sec,
                     "slow_windows": 0
                 }
-                # Do NOT evaluate pruning this cycle
-                # log_line(self.cfg.log_file, f"[reset] seq={seq} cooldown until {int(now + self.cfg.reset_cooldown_sec)}")
                 continue
 
             # Update last_increase_ts if we saw growth
             delta = max(0, new_pkt - prev_pkt)
             if delta > 0:
                 last_increase_ts = now
-                slow_windows = 0  # reset slow window streak
+                slow_windows = 0  # reset streak
 
-            # Periodically advance the baseline on full windows
+            # Advance the baseline on full windows
             if elapsed >= self.cfg.window_seconds:
                 if delta < self.cfg.packet_threshold:
                     slow_windows += 1
                 else:
                     slow_windows = 0
-                prev_ts = now  # re-baseline time
-                prev_pkt = new_pkt  # re-baseline pkt
+                prev_ts = now
+                prev_pkt = new_pkt
 
-            # Persist updated state (before prune decision)
+            # Persist updated state (before decision)
             self.state.pkt_state[seq] = {
                 "pkt": new_pkt,
                 "last_reset": new_lrt,
@@ -708,11 +775,15 @@ class ElephantGuard:
             if now - added_ts < self.cfg.min_hold_after_add_sec:
                 continue
 
-            # Prune if either condition met:
-            # 1) No increase for prune_inactive_after seconds (true inactivity)
-            # 2) Sustained trickle: below threshold for N consecutive full windows
+            # Two prune paths:
+            # 1) Long inactivity
             no_increase_for = now - (last_increase_ts or added_ts)
-            if no_increase_for >= self.cfg.prune_inactive_after or slow_windows >= self.cfg.consecutive_slow_windows:
+            if no_increase_for >= self.cfg.prune_inactive_after:
+                to_remove.append(seq)
+                continue
+
+            # 2) Sustained trickle (N slow windows)
+            if slow_windows >= self.cfg.consecutive_slow_windows:
                 to_remove.append(seq)
 
         for seq in to_remove:
@@ -742,12 +813,17 @@ class ElephantGuard:
             log_line(self.cfg.log_file, f"[warn] delete seq={seq} failed: {e}")
             return
 
+        # mutation markers
+        now = time.time()
+        self.last_mutation_ts = now
+        self.controller_quiet_until = now + self.cfg.reset_cooldown_sec
+
         self.state.seq_map.pop(pair, None)
         self.alloc.free(seq)
         self.state.pkt_state.pop(seq, None)
 
     def housekeep(self, initial: bool = False):
-        """Light alignment of baselines and maintenance; does not force pruning."""
+        """Light alignment; does not force pruning."""
         try:
             counts = self.dmf.get_flow_info()
         except Exception as e:
@@ -773,17 +849,26 @@ class ElephantGuard:
                 }
                 continue
 
-            # If baseline is very old, gently refresh timestamps
+            # If baseline is very old, refresh timestamps lightly
             if now - float(ps.get("ts", now)) > 2 * self.cfg.window_seconds:
                 ps["ts"] = now
 
-            # Keep last_reset and pkt current (no pruning here)
-            ps["pkt"] = new_pkt
+            # Keep counters current (no pruning here)
+            if new_pkt > int(ps.get("pkt", 0)):
+                ps["pkt"] = new_pkt
+                ps["last_increase_ts"] = now
             ps["last_reset"] = new_lrt
             self.state.pkt_state[seq] = ps
 
         self.state.last_housekeep = now
+
+        # Summary telemetry
+        active = len(self.state.seq_map)
+        qlen = len(getattr(self, "pending_pairs", []))
         log_line(self.cfg.log_file, "[housekeep] " + ("initial alignment complete" if initial else "periodic alignment complete"))
+        log_line(self.cfg.log_file, f"[summary] active_rules={active} pending_queue={qlen} "
+                                    f"window={self.cfg.window_seconds}s thr={self.cfg.packet_threshold} "
+                                    f"hold={self.cfg.min_hold_after_add_sec}s reset_cd={self.cfg.reset_cooldown_sec}s")
 
 
 # =========================
